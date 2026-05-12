@@ -301,6 +301,9 @@ function bumpPlatform(platformId, delta) {
   // _offsetPendingSince tracks the timestamp of the last bump so pull() can
   // clear a stuck offset if no server movement is seen within OFFSET_TIMEOUT_MS.
   _offsetPendingSince[platformId] = Date.now();
+  window.__diag = window.__diag || { pulls: [], bumps: [] };
+  window.__diag.bumps.push({ t: Date.now(), platformId, delta, offsetAfter: offsets[platformId] });
+  if (window.__diag.bumps.length > 50) window.__diag.bumps.shift();
   fetch(WEBHOOK_URL, {
     method: 'POST', mode: 'no-cors',
     headers: { 'Content-Type': 'text/plain' },
@@ -636,23 +639,22 @@ async function pull() {
     //   - Server dropped sharply (e.g. midnight Kuwait rolled today→0) AND we
     //     held a positive offset → trust the server and clear our offset, so
     //     a stale +1 doesn't survive the daily reset and inflate the new day.
+    window.__diag = window.__diag || { pulls: [], bumps: [] };
+    const _diagPull = { t: Date.now(), platforms: {} };
     Object.keys(offsets).forEach(k => {
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
       const prevToday = serverLastSeenToday[k] || 0;
       const serverDelta = newToday - prevToday;
+      const _before = offsets[k];
       if (serverDelta !== 0 && offsets[k] !== 0) {
         if (offsets[k] > 0 && serverDelta > 0) {
           offsets[k] = Math.max(0, offsets[k] - serverDelta);
         } else if (offsets[k] < 0 && serverDelta < 0) {
           offsets[k] = Math.min(0, offsets[k] - serverDelta);
         } else if (offsets[k] > 0 && serverDelta <= -3) {
-          offsets[k] = 0;  // rollover signal — drop optimistic carry
+          offsets[k] = 0;
         }
       }
-      // Stuck-offset safety net: if a bump was issued more than
-      // OFFSET_TIMEOUT_MS ago and the server still hasn't moved, force the
-      // offset to zero so the display reverts to the authoritative count.
-      // This catches the silent-failure case (webhook never landed).
       if (offsets[k] !== 0 && _offsetPendingSince[k]
           && (Date.now() - _offsetPendingSince[k]) > OFFSET_TIMEOUT_MS) {
         offsets[k] = 0;
@@ -660,8 +662,11 @@ async function pull() {
       } else if (offsets[k] === 0) {
         _offsetPendingSince[k] = 0;
       }
+      _diagPull.platforms[k] = { newToday, prevToday, serverDelta, offsetBefore: _before, offsetAfter: offsets[k] };
       serverLastSeenToday[k] = newToday;
     });
+    window.__diag.pulls.push(_diagPull);
+    if (window.__diag.pulls.length > 50) window.__diag.pulls.shift();
     lastSeenData = parsed.platforms;
     lastSeenMeta = parsed.meta || {};
     render(parsed);
