@@ -290,13 +290,38 @@ function bumpPlatform(platformId, delta) {
     }
   }
   playChime(delta > 0 ? 'plus' : 'minus');
+  showToast(delta > 0 ? '✓ +1 تم' : '✓ −1 تم');
+  // Authoritative webhook call. On success → immediate pull (server is the
+  // source of truth). On failure → roll back the optimistic offset and tell
+  // the user. mode:'no-cors' was hiding silent failures.
   fetch(WEBHOOK_URL, {
-    method: 'POST', mode: 'no-cors',
+    method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: JSON.stringify({ platform: platformId, delta, secret: WEBHOOK_SECRET, source: 'public-dashboard' })
-  }).catch(()=>{});
-  showToast(delta > 0 ? '✓ +1 تم' : '✓ −1 تم');
-  setTimeout(pull, 2500);
+  })
+  .then(r => r.json())
+  .then(j => {
+    if (!j || !j.ok) throw new Error(j && j.error ? j.error : 'write_failed');
+    schedulePull(150);
+  })
+  .catch(() => {
+    // Roll back the optimistic offset so the display reflects truth.
+    offsets[platformId] = (offsets[platformId] || 0) - delta;
+    render({ platforms: lastSeenData, meta: lastSeenMeta });
+    showToast('✗ ما وصل — حاول مرة ثانية');
+  });
+}
+
+// Single shared scheduler so rapid clicks coalesce to ONE pull. Without this,
+// each click queued its own setTimeout(pull,2500) — N rapid clicks scheduled
+// N pulls that landed out of order and produced visible flicker.
+let _scheduledPullTimer = null;
+function schedulePull(delayMs) {
+  if (_scheduledPullTimer) clearTimeout(_scheduledPullTimer);
+  _scheduledPullTimer = setTimeout(() => {
+    _scheduledPullTimer = null;
+    pull();
+  }, delayMs);
 }
 
 let lastSeenData = {};
@@ -590,16 +615,25 @@ function timeAgo(date) {
 }
 
 // ─── Poll loop ────────────────────────────────────────
+// Single-flight guard: at most one pull is in flight at any time. Without
+// this, the 20s interval pull and a click-triggered pull could overlap and
+// their fetch responses could land out of order, producing a momentary
+// jump back to a stale server count.
+let _pullInFlight = false;
 async function pull() {
+  if (_pullInFlight) return;
+  _pullInFlight = true;
   const liveText = document.getElementById('liveText');
   try {
     const r = await fetch(CSV_URL + '&_=' + Date.now(), { cache: 'no-store' });
     if (!r.ok) throw new Error('http_' + r.status);
     const text = await r.text();
     const parsed = parseState(text);
-    // Bidirectional offset drain: when server moves in the same direction
-    // as our pending offset, shrink the offset toward zero. Works for +1 and -1.
-    // Treat unseen-before as 0 so the first pull after a fresh click still drains.
+    // Bidirectional offset drain:
+    //   - Server moved in the same direction as our offset → shrink the offset.
+    //   - Server dropped sharply (e.g. midnight Kuwait rolled today→0) AND we
+    //     held a positive offset → trust the server and clear our offset, so
+    //     a stale +1 doesn't survive the daily reset and inflate the new day.
     Object.keys(offsets).forEach(k => {
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
       const prevToday = serverLastSeenToday[k] || 0;
@@ -609,6 +643,8 @@ async function pull() {
           offsets[k] = Math.max(0, offsets[k] - serverDelta);
         } else if (offsets[k] < 0 && serverDelta < 0) {
           offsets[k] = Math.min(0, offsets[k] - serverDelta);
+        } else if (offsets[k] > 0 && serverDelta <= -3) {
+          offsets[k] = 0;  // rollover signal — drop optimistic carry
         }
       }
       serverLastSeenToday[k] = newToday;
@@ -620,6 +656,8 @@ async function pull() {
     liveText.textContent = 'LIVE';
   } catch (e) {
     liveText.textContent = 'OFFLINE';
+  } finally {
+    _pullInFlight = false;
   }
 }
 
