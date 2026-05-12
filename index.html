@@ -579,14 +579,19 @@ async function pull() {
     if (!r.ok) throw new Error('http_' + r.status);
     const text = await r.text();
     const parsed = parseState(text);
-    // Diff-based offset clearing: when server's today_count grows, drain our local offset.
-    // Treat unseen-before as 0 so the first pull after a fresh +1 click still drains the offset.
+    // Bidirectional offset drain: when server moves in the same direction
+    // as our pending offset, shrink the offset toward zero. Works for +1 and -1.
+    // Treat unseen-before as 0 so the first pull after a fresh click still drains.
     Object.keys(offsets).forEach(k => {
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
       const prevToday = serverLastSeenToday[k] || 0;
-      if (newToday > prevToday) {
-        const diff = newToday - prevToday;
-        offsets[k] = Math.max(0, offsets[k] - diff);
+      const serverDelta = newToday - prevToday;
+      if (serverDelta !== 0 && offsets[k] !== 0) {
+        if (offsets[k] > 0 && serverDelta > 0) {
+          offsets[k] = Math.max(0, offsets[k] - serverDelta);
+        } else if (offsets[k] < 0 && serverDelta < 0) {
+          offsets[k] = Math.min(0, offsets[k] - serverDelta);
+        }
       }
       serverLastSeenToday[k] = newToday;
     });
