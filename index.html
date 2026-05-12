@@ -218,6 +218,10 @@ const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=
 const WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbwkArekZ_HQP-ewcLbnnNxXPBOFBJBZiC0m3VSbtLWfSo8i6ysMYdh8TMAAvCndGyBa/exec';
 const WEBHOOK_SECRET = 'reels-2026-E4ox3kqmoK2JAg';
 const offsets = { tiktok: 0, instagram: 0, youtube_shorts: 0, youtube_long: 0 };
+// Per-platform last-seen server today_count + total_count, for diff-based offset clearing.
+const serverLastSeenToday = {};
+const serverLastSeenTotal = {};
+let lastSeenMeta = {};
 
 // ── Sound (WebAudio) + mute persistence ────────────────
 let muted = (localStorage.getItem('reels.muted') === '1');
@@ -266,15 +270,18 @@ function bumpPlatform(platformId, delta) {
   const cur = (parseFloat(data.today_count) || 0) + (offsets[platformId] || 0);
   if (delta < 0 && cur + delta < 0) return;
   offsets[platformId] = (offsets[platformId] || 0) + delta;
-  // Optimistic re-render
+  // Optimistic re-render: cards + headline minis + footer (all in one render call)
+  render({ platforms: lastSeenData, meta: lastSeenMeta });
+  // Animate the bumped card
   const card = document.querySelector(`.card[data-platform="${platformId}"]`);
   if (card) {
-    const todayEl = card.querySelector('[data-today]');
-    if (todayEl) todayEl.textContent = (parseFloat(data.today_count) || 0) + offsets[platformId];
     card.classList.add('pulse'); setTimeout(()=>card.classList.remove('pulse'), 700);
+    const todayEl = card.querySelector('[data-today]');
+    if (todayEl && delta > 0) {
+      todayEl.classList.remove('bumping'); void todayEl.offsetWidth; todayEl.classList.add('bumping');
+    }
   }
   playChime(delta > 0 ? 'plus' : 'minus');
-  // Fire webhook (no-cors fire-and-forget)
   fetch(WEBHOOK_URL, {
     method: 'POST', mode: 'no-cors',
     headers: { 'Content-Type': 'text/plain' },
@@ -450,13 +457,13 @@ const lastSeenTotals = {};
 function render(parsed) {
   const { platforms, meta } = parsed;
 
-  // Headline minis
+  // Headline minis (apply offsets so optimistic +1 is reflected immediately)
   HEADLINE_PLATFORMS.forEach(pid => {
     const d = platforms[pid] || {};
     const item = document.querySelector(`[data-mini="${pid}"]`);
     if (!item) return;
     const goal = d.total_goal || 0;
-    const cur = d.total_count || 0;
+    const cur = (d.total_count || 0) + (offsets[pid] || 0);
     item.querySelector('[data-mini-fill]').style.width = Math.min(100, goal ? (cur / goal) * 100 : 0) + '%';
     item.querySelector('[data-mini-num]').textContent = cur;
     item.querySelector('[data-mini-goal]').textContent = ' / ' + goal;
@@ -479,8 +486,9 @@ function render(parsed) {
     const card = grid.querySelector(`.card[data-platform="${p.id}"]`);
     if (!card) return;
     const d = platforms[p.id] || {};
-    const today = d.today_count || 0;
-    const total = d.total_count || 0;
+    const offset = offsets[p.id] || 0;
+    const today = (d.today_count || 0) + offset;
+    const total = (d.total_count || 0) + offset;
     const daily = d.daily_goal || 0;
     const totalGoal = d.total_goal || 0;
     const status = d.status || '';
@@ -568,13 +576,18 @@ async function pull() {
     if (!r.ok) throw new Error('http_' + r.status);
     const text = await r.text();
     const parsed = parseState(text);
-    lastSeenData = parsed.platforms;
-    // Clear offsets that the server has now caught up on
+    // Diff-based offset clearing: when server's today_count grows, drain our local offset.
     Object.keys(offsets).forEach(k => {
-      const serverTotal = (parsed.platforms[k] || {}).total_count || 0;
-      const expected = ((lastSeenData[k] && lastSeenData[k]._prevTotal) || 0) + offsets[k];
-      if (serverTotal >= expected) offsets[k] = 0;
+      const newToday = (parsed.platforms[k] || {}).today_count || 0;
+      const prevToday = serverLastSeenToday[k];
+      if (prevToday !== undefined && newToday > prevToday) {
+        const diff = newToday - prevToday;
+        offsets[k] = Math.max(0, offsets[k] - diff);
+      }
+      serverLastSeenToday[k] = newToday;
     });
+    lastSeenData = parsed.platforms;
+    lastSeenMeta = parsed.meta || {};
     render(parsed);
 
     const ytStatuses = [
