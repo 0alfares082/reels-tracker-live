@@ -726,13 +726,34 @@ async function pull() {
     //   - Server dropped sharply (e.g. midnight Kuwait rolled today→0) AND we
     //     held a positive offset → trust the server and clear our offset, so
     //     a stale +1 doesn't survive the daily reset and inflate the new day.
-    // Secondary safety net: time out entries older than 10s. JSONP responses
-    // already drain the queue per-click; this only kicks in if the entire
-    // request silently fails (no callback, no error).
+    // Two-pronged drain:
+    //   1. FIFO match against server movement — if the server's today_count
+    //      moved by Δ in the queue head's direction, pop entries totalling Δ.
+    //      This catches confirmations that the JSONP path missed (network
+    //      drop, callback lost, etc.) before lastSeenData updates and
+    //      double-counts the still-pending entry.
+    //   2. 10s time-out — drop any entry stuck in the queue for too long.
     const now = Date.now();
     Object.keys(pendingDeltas).forEach(k => {
-      pendingDeltas[k] = pendingDeltas[k].filter(e => now - e.at < 10000);
-      serverLastSeenToday[k] = (parsed.platforms[k] || {}).today_count || 0;
+      const newToday = (parsed.platforms[k] || {}).today_count || 0;
+      const prevToday = serverLastSeenToday[k];
+      let serverDelta = (prevToday === undefined) ? 0 : (newToday - prevToday);
+      const q = pendingDeltas[k];
+      while (q.length > 0 && serverDelta !== 0) {
+        const head = q[0];
+        if (Math.sign(head.delta) !== Math.sign(serverDelta)) break;
+        const absHead = Math.abs(head.delta);
+        const absSrv = Math.abs(serverDelta);
+        if (absSrv >= absHead) {
+          serverDelta -= head.delta;
+          q.shift();
+        } else {
+          head.delta -= Math.sign(head.delta) * absSrv;
+          serverDelta = 0;
+        }
+      }
+      pendingDeltas[k] = q.filter(e => now - e.at < 10000);
+      serverLastSeenToday[k] = newToday;
     });
     lastSeenData = parsed.platforms;
     lastSeenMeta = parsed.meta || {};
