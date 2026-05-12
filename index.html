@@ -85,6 +85,15 @@
   .card-of b { color: var(--soft-white); font-weight: 700; }
   .card-remaining { font-size: 14px; color: var(--sky); margin-bottom: 22px; font-weight: 500; }
   .card-remaining.done { color: var(--orange); text-shadow: 0 0 12px var(--orange-glow); }
+  .ctrl-row { display: flex; gap: 7px; margin-top: 14px; margin-bottom: 4px; }
+  .ctrl-btn { flex: 1; padding: 10px 0; border-radius: 10px; font-family: 'Inter', sans-serif; font-size: 22px; font-weight: 700; cursor: pointer; border: 1.5px solid; background: transparent; transition: background .15s, transform .1s; -webkit-tap-highlight-color: transparent; user-select: none; line-height: 1; }
+  .ctrl-btn:active { transform: scale(0.93); }
+  .ctrl-btn.plus { background: rgba(165,232,255,0.08); border-color: rgba(165,232,255,0.28); color: var(--sky); }
+  .ctrl-btn.plus:hover { background: rgba(165,232,255,0.16); border-color: var(--sky); }
+  .ctrl-btn.minus { background: rgba(248,113,113,0.06); border-color: rgba(248,113,113,0.22); color: #F87171; }
+  .ctrl-btn.minus:hover { background: rgba(248,113,113,0.14); }
+  .card.pulse { animation: pulse-card 0.7s ease-out; }
+  @keyframes pulse-card { 0% { box-shadow: 0 0 0 0 rgba(165,232,255,0.5); } 100% { box-shadow: 0 0 0 14px rgba(165,232,255,0); } }
   .card-progress-label { display: flex; justify-content: space-between; font-family: 'Inter',sans-serif; font-size: 11px; color: var(--muted); margin-bottom: 8px; letter-spacing: 0.06em; }
   .card-progress-label b { color: var(--soft-white); font-weight: 700; }
 
@@ -163,6 +172,33 @@
 // ─── Config ───────────────────────────────────────────
 const SHEET_ID = '1HoMqTmBTEvw3XCq-Fy2CnxY2SOLauOCpJllLewfnMXw';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=counts`;
+const WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbwkArekZ_HQP-ewcLbnnNxXPBOFBJBZiC0m3VSbtLWfSo8i6ysMYdh8TMAAvCndGyBa/exec';
+const WEBHOOK_SECRET = 'reels-2026-E4ox3kqmoK2JAg';
+const offsets = { tiktok: 0, instagram: 0, youtube_shorts: 0, youtube_long: 0 };
+
+function bumpPlatform(platformId, delta) {
+  const data = lastSeenData[platformId] || {};
+  const cur = (parseFloat(data.today_count) || 0) + (offsets[platformId] || 0);
+  if (delta < 0 && cur + delta < 0) return;
+  offsets[platformId] = (offsets[platformId] || 0) + delta;
+  // Optimistic re-render
+  const card = document.querySelector(`.card[data-platform="${platformId}"]`);
+  if (card) {
+    const todayEl = card.querySelector('[data-today]');
+    if (todayEl) todayEl.textContent = (parseFloat(data.today_count) || 0) + offsets[platformId];
+    card.classList.add('pulse'); setTimeout(()=>card.classList.remove('pulse'), 700);
+  }
+  // Fire webhook (no-cors fire-and-forget)
+  fetch(WEBHOOK_URL, {
+    method: 'POST', mode: 'no-cors',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ platform: platformId, delta, secret: WEBHOOK_SECRET, source: 'public-dashboard' })
+  }).catch(()=>{});
+  // Refresh from sheet shortly to absorb the offset
+  setTimeout(pull, 2500);
+}
+
+let lastSeenData = {};
 const POLL_INTERVAL_MS = 20000;  // 20s
 const SKOOL_GOAL = 2000;
 const END_DATE = '2026-09-11';
@@ -292,8 +328,13 @@ function buildCards() {
     const progBar = el('div', { class: 'progress-bar' },
       el('div', { class: 'progress-fill', 'data-fill': '', style: 'width: 0%' })
     );
+    const btnMinus = el('button', { class: 'ctrl-btn minus', type: 'button' }, '−');
+    const btnPlus  = el('button', { class: 'ctrl-btn plus',  type: 'button' }, '+');
+    btnMinus.addEventListener('click', () => bumpPlatform(p.id, -1));
+    btnPlus.addEventListener('click',  () => bumpPlatform(p.id, +1));
+    const ctrlRow = el('div', { class: 'ctrl-row' }, btnMinus, btnPlus);
     const card = el('div', { class: 'card', 'data-platform': p.id },
-      head, todayRow, remaining, progLabel, progBar
+      head, todayRow, remaining, progLabel, progBar, ctrlRow
     );
     grid.appendChild(card);
   });
@@ -441,6 +482,13 @@ async function pull() {
     if (!r.ok) throw new Error('http_' + r.status);
     const text = await r.text();
     const parsed = parseState(text);
+    lastSeenData = parsed.platforms;
+    // Clear offsets that the server has now caught up on
+    Object.keys(offsets).forEach(k => {
+      const serverTotal = (parsed.platforms[k] || {}).total_count || 0;
+      const expected = ((lastSeenData[k] && lastSeenData[k]._prevTotal) || 0) + offsets[k];
+      if (serverTotal >= expected) offsets[k] = 0;
+    });
     render(parsed);
 
     const ytStatuses = [
