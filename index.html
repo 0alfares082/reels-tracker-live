@@ -225,10 +225,22 @@ const SHEET_ID = '1HoMqTmBTEvw3XCq-Fy2CnxY2SOLauOCpJllLewfnMXw';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=counts`;
 const WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbwkArekZ_HQP-ewcLbnnNxXPBOFBJBZiC0m3VSbtLWfSo8i6ysMYdh8TMAAvCndGyBa/exec';
 const WEBHOOK_SECRET = 'reels-2026-E4ox3kqmoK2JAg';
-const offsets = { tiktok: 0, instagram: 0, youtube_shorts: 0, youtube_long: 0 };
-// Per-platform last-seen server today_count + total_count, for diff-based offset clearing.
+// ── Pending-deltas FIFO per platform ─────────────────────
+// Each click pushes an entry. Each pull pops entries from the FRONT as the
+// server confirms them in order. This is the ONLY correct way to handle
+// mixed +1/-1 bursts: a summary offset breaks when the server confirms one
+// direction before the other (e.g. user does +8 then -5 — Apps Script
+// processes the +8 first, the pull sees serverDelta=+6 mid-burst, and a
+// summary offset would mistakenly drain +1s that haven't been confirmed yet).
+const pendingDeltas = { tiktok: [], instagram: [], youtube_shorts: [], youtube_long: [] };
+function pendingSum(p) { return (pendingDeltas[p] || []).reduce((s, e) => s + e.delta, 0); }
+// Back-compat surface — render() still reads offsets[p] for display math.
+const offsets = new Proxy({}, {
+  get(_, p) { return pendingSum(p); },
+  set(_, p, v) { /* writes go through bumpPlatform / pull */ return true; },
+});
+// Per-platform last-confirmed server today_count, for the FIFO pop logic.
 const serverLastSeenToday = {};
-const serverLastSeenTotal = {};
 let lastSeenMeta = {};
 
 // ── Sound (WebAudio) + mute persistence ────────────────
@@ -275,9 +287,9 @@ function showToast(msg) {
 
 function bumpPlatform(platformId, delta) {
   const data = lastSeenData[platformId] || {};
-  const cur = (parseFloat(data.today_count) || 0) + (offsets[platformId] || 0);
+  const cur = (parseFloat(data.today_count) || 0) + pendingSum(platformId);
   if (delta < 0 && cur + delta < 0) return;
-  offsets[platformId] = (offsets[platformId] || 0) + delta;
+  pendingDeltas[platformId].push({ delta, at: Date.now() });
   // Optimistic re-render: cards + headline minis + footer (all in one render call)
   render({ platforms: lastSeenData, meta: lastSeenMeta });
   // Animate the bumped card
@@ -298,17 +310,18 @@ function bumpPlatform(platformId, delta) {
   // rolled back offsets even though the server received the writes).
   // Trust strategy: schedule a quick pull right after the click — the pull
   // reads the authoritative sheet state and drains the offset deterministically.
-  // _offsetPendingSince tracks the timestamp of the last bump so pull() can
-  // clear a stuck offset if no server movement is seen within OFFSET_TIMEOUT_MS.
-  _offsetPendingSince[platformId] = Date.now();
+  // pendingDeltas[platformId] is the FIFO source of truth — the head expires
+  // 10s after its `at` if the server never moves (silent webhook failure).
   window.__diag = window.__diag || { pulls: [], bumps: [] };
-  window.__diag.bumps.push({ t: Date.now(), platformId, delta, offsetAfter: offsets[platformId] });
+  window.__diag.bumps.push({ t: Date.now(), platformId, delta, pendingSum: pendingSum(platformId), pendingLen: pendingDeltas[platformId].length });
   if (window.__diag.bumps.length > 50) window.__diag.bumps.shift();
-  fetch(WEBHOOK_URL, {
-    method: 'POST', mode: 'no-cors',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify({ platform: platformId, delta, secret: WEBHOOK_SECRET, source: 'public-dashboard' })
-  }).catch(() => {});
+  // GET request follows the Apps Script redirect cleanly. POST + no-cors
+  // surfaced as net::ERR_ABORTED under parallel-click load.
+  const url = WEBHOOK_URL + '?' + new URLSearchParams({
+    platform: platformId, delta: String(delta),
+    secret: WEBHOOK_SECRET, source: 'public-dashboard',
+  }).toString();
+  fetch(url, { mode: 'no-cors' }).catch(() => {});
   schedulePull(1200);
 }
 
@@ -323,11 +336,6 @@ function schedulePull(delayMs) {
   }, delayMs);
 }
 
-// Per-platform timestamp of the last bump. Used to time-out stuck offsets
-// (case: webhook silently fails — without this the optimistic offset survives
-// forever and the user sees an inflated local count until refresh).
-const _offsetPendingSince = {};
-const OFFSET_TIMEOUT_MS = 6000;
 
 let lastSeenData = {};
 const POLL_INTERVAL_MS = 20000;  // 20s
@@ -641,28 +649,36 @@ async function pull() {
     //     a stale +1 doesn't survive the daily reset and inflate the new day.
     window.__diag = window.__diag || { pulls: [], bumps: [] };
     const _diagPull = { t: Date.now(), platforms: {} };
-    Object.keys(offsets).forEach(k => {
+    // FIFO drain — pop pending deltas as the server catches up, in order.
+    // This handles +/- interleaving correctly: an optimistic +1 popped only
+    // when the server has actually applied a +1; an optimistic -1 popped only
+    // when the server has actually applied a -1.
+    Object.keys(pendingDeltas).forEach(k => {
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
-      const prevToday = serverLastSeenToday[k] || 0;
-      const serverDelta = newToday - prevToday;
-      const _before = offsets[k];
-      if (serverDelta !== 0 && offsets[k] !== 0) {
-        if (offsets[k] > 0 && serverDelta > 0) {
-          offsets[k] = Math.max(0, offsets[k] - serverDelta);
-        } else if (offsets[k] < 0 && serverDelta < 0) {
-          offsets[k] = Math.min(0, offsets[k] - serverDelta);
-        } else if (offsets[k] > 0 && serverDelta <= -3) {
-          offsets[k] = 0;
+      const prevToday = serverLastSeenToday[k];
+      const _sumBefore = pendingSum(k);
+      let serverDelta = (prevToday === undefined) ? 0 : (newToday - prevToday);
+      const q = pendingDeltas[k];
+      // Pop entries from the front while the server is still moving in the
+      // direction of the head entry. Stop at the first sign mismatch.
+      while (q.length > 0 && serverDelta !== 0) {
+        const head = q[0];
+        if (Math.sign(head.delta) !== Math.sign(serverDelta)) break;
+        const absHead = Math.abs(head.delta);
+        const absSrv = Math.abs(serverDelta);
+        if (absSrv >= absHead) {
+          serverDelta -= head.delta;
+          q.shift();
+        } else {
+          head.delta -= Math.sign(head.delta) * absSrv;
+          serverDelta = 0;
         }
       }
-      if (offsets[k] !== 0 && _offsetPendingSince[k]
-          && (Date.now() - _offsetPendingSince[k]) > OFFSET_TIMEOUT_MS) {
-        offsets[k] = 0;
-        _offsetPendingSince[k] = 0;
-      } else if (offsets[k] === 0) {
-        _offsetPendingSince[k] = 0;
-      }
-      _diagPull.platforms[k] = { newToday, prevToday, serverDelta, offsetBefore: _before, offsetAfter: offsets[k] };
+      // Time out entries older than 10s — assume the webhook silently failed
+      // and stop letting them inflate the optimistic display indefinitely.
+      const now = Date.now();
+      pendingDeltas[k] = q.filter(e => now - e.at < 10000);
+      _diagPull.platforms[k] = { newToday, prevToday, serverDelta_init: (prevToday === undefined ? 0 : (newToday - prevToday)), sumBefore: _sumBefore, sumAfter: pendingSum(k), qLen: pendingDeltas[k].length };
       serverLastSeenToday[k] = newToday;
     });
     window.__diag.pulls.push(_diagPull);
