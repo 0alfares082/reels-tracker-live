@@ -546,9 +546,13 @@ function render(parsed) {
     if (!card) return;
     const d = platforms[p.id] || {};
     const offset = offsets[p.id] || 0;
-    const today = (d.today_count || 0) + offset;
-    const total = (d.total_count || 0) + offset;
-    const week = (d.week_count || 0) + offset;
+    // Floor display values at 0 — the FIFO drain can momentarily produce
+    // negative composites when +1s and -1s are processed out of order on
+    // the server. The bumpPlatform gate prevents going below 0 in the user's
+    // intent; this is a render-side safety against display glitches.
+    const today = Math.max(0, (d.today_count || 0) + offset);
+    const total = Math.max(0, (d.total_count || 0) + offset);
+    const week = Math.max(0, (d.week_count || 0) + offset);
     const daily = d.daily_goal || 0;
     const totalGoal = d.total_goal || 0;
     const weeklyGoal = d.weekly_goal || 0;
