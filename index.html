@@ -222,7 +222,13 @@
 <script>
 // ─── Config ───────────────────────────────────────────
 const SHEET_ID = '1HoMqTmBTEvw3XCq-Fy2CnxY2SOLauOCpJllLewfnMXw';
-const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=counts`;
+// docs export?format=csv preserves all cell values raw. gviz/tq?out=csv was
+// inferring column B's type as "number" because of the 2000/3000 cells in the
+// meta section, then silently DROPPING the string values (current_day,
+// current_iso_week, last_post_at) on read — so the client-side stale-day
+// detection had no current_day to compare against and the lastPost timeAgo
+// label was permanently empty. gid is the counts sheet's numeric id.
+const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=361543292`;
 const WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbwkArekZ_HQP-ewcLbnnNxXPBOFBJBZiC0m3VSbtLWfSo8i6ysMYdh8TMAAvCndGyBa/exec';
 const WEBHOOK_SECRET = 'reels-2026-E4ox3kqmoK2JAg';
 // ── Pending-deltas FIFO per platform ─────────────────────
@@ -241,6 +247,14 @@ const offsets = new Proxy({}, {
 });
 // Per-platform last-confirmed server today_count, for the FIFO pop logic.
 const serverLastSeenToday = {};
+// Per-platform `at` of the most-recent JSONP response we acted on (i.e. the
+// click submission time of the highest-`at` write whose response has come back).
+// Older out-of-order responses are ignored so lastSeenData never rolls backward.
+const lastResponseAt = {};
+// Per-platform wall-clock timestamp of the last JSONP response — used by the
+// pull loop to detect "my CSV fetch is older than the latest JSONP, so my
+// data is stale for this platform; skip overwriting."
+const lastJsonpAt = {};
 let lastSeenMeta = {};
 
 // ── Sound (WebAudio) + mute persistence ────────────────
@@ -303,19 +317,13 @@ function bumpPlatform(platformId, delta) {
   }
   playChime(delta > 0 ? 'plus' : 'minus');
   showToast(delta > 0 ? '✓ +1 تم' : '✓ −1 تم');
-  // Fire-and-forget POST to the webhook. We use no-cors because Apps Script's
-  // 302 redirect to script.googleusercontent.com is finicky with browser CORS
-  // when several writes are in flight at once (Playwright surfaced this:
-  // sequential clicks pass but parallel cross-card bursts hit CORS errors and
-  // rolled back offsets even though the server received the writes).
-  // Trust strategy: schedule a quick pull right after the click — the pull
-  // reads the authoritative sheet state and drains the offset deterministically.
-  // pendingDeltas[platformId] is the FIFO source of truth — the head expires
-  // 10s after its `at` if the server never moves (silent webhook failure).
-  // JSONP — Apps Script returns `callback(json)`, the browser executes it, no
-  // CORS preflight, no opaque redirect. The callback gets the authoritative
-  // {ok, today_count, total_count, week_count} per click so we can drain or
-  // reject the matching pending entry instead of guessing from server deltas.
+  // JSONP write. Apps Script returns `callback(json)` which the browser
+  // executes — no CORS preflight, no opaque redirect, no parallel-request
+  // race (which is what broke POST + no-cors under Playwright). The callback
+  // gets the authoritative {ok, today_count, ...} for THIS exact click, so
+  // we drain the matching queue entry deterministically.
+  // The pull at +1500ms is a safety net for the case where the JSONP callback
+  // itself never fires (network drop) — pull's FIFO drain catches it.
   sendWebhookJSONP(platformId, delta, pendingDeltas[platformId][pendingDeltas[platformId].length - 1]);
   schedulePull(1500);
 }
@@ -332,16 +340,28 @@ function sendWebhookJSONP(platformId, delta, entry) {
   window[cb] = (res) => {
     finish();
     const q = pendingDeltas[platformId];
-    const idx = entry ? q.indexOf(entry) : -1;
+    const myAt = entry ? entry.at : 0;
     if (res && res.ok) {
-      if (idx !== -1) q.splice(idx, 1);
-      // Snap to authoritative server values returned by this exact write.
-      lastSeenData[platformId] = Object.assign({}, lastSeenData[platformId], {
-        today_count: res.today_count, total_count: res.total_count, week_count: res.week_count,
-      });
-      serverLastSeenToday[platformId] = res.today_count;
+      // Pop EVERY entry submitted at-or-before this one. Apps Script's
+      // LockService processes webhook calls in arrival order, so any earlier
+      // click must have already landed by the time this response comes back.
+      // Without this, an out-of-order JSONP response would only remove its
+      // exact entry, leaving earlier ones in the queue and double-counting.
+      pendingDeltas[platformId] = q.filter(e => e.at > myAt);
+      // Snap lastSeenData ONLY if this response is the most-recent click
+      // we've heard back about. Older responses would roll the server snap
+      // backwards and produce a visible flicker.
+      if ((lastResponseAt[platformId] || 0) <= myAt) {
+        lastResponseAt[platformId] = myAt;
+        lastJsonpAt[platformId] = Date.now();
+        lastSeenData[platformId] = Object.assign({}, lastSeenData[platformId], {
+          today_count: res.today_count, total_count: res.total_count, week_count: res.week_count,
+        });
+        serverLastSeenToday[platformId] = res.today_count;
+      }
       render({ platforms: lastSeenData, meta: lastSeenMeta });
     } else {
+      const idx = entry ? q.indexOf(entry) : -1;
       if (idx !== -1) q.splice(idx, 1);
       const why = (res && res.error) || 'unknown';
       showToast(why === 'would_go_negative' ? '✗ ما نقدر ننقص أكثر' : '✗ ما انحفظت — جرّب مرة ثانية');
@@ -707,38 +727,38 @@ function timeAgo(date) {
 }
 
 // ─── Poll loop ────────────────────────────────────────
-// Single-flight guard: at most one pull is in flight at any time. Without
-// this, the 20s interval pull and a click-triggered pull could overlap and
-// their fetch responses could land out of order, producing a momentary
-// jump back to a stale server count.
+// Single-flight guard plus a "run-again-after" flag: if a click-driven pull
+// fires while another pull is in flight, we re-run after the current one
+// finishes so we never lose the confirmation pass.
 let _pullInFlight = false;
+let _pullAgain = false;
 async function pull() {
-  if (_pullInFlight) return;
+  if (_pullInFlight) { _pullAgain = true; return; }
   _pullInFlight = true;
+  // Stamp the moment our CSV fetch leaves the wire. Per-platform updates
+  // below are gated against this — if a JSONP response arrived AFTER we
+  // started fetching, our CSV data is staler than what JSONP already wrote,
+  // so we must not overwrite lastSeenData for that platform.
+  const pullStartedAt = Date.now();
   const liveText = document.getElementById('liveText');
   try {
-    const r = await fetch(CSV_URL + '&_=' + Date.now(), { cache: 'no-store' });
+    const r = await fetch(CSV_URL + '&_=' + pullStartedAt, { cache: 'no-store' });
     if (!r.ok) throw new Error('http_' + r.status);
     const text = await r.text();
     const parsed = parseState(text);
-    // Bidirectional offset drain:
-    //   - Server moved in the same direction as our offset → shrink the offset.
-    //   - Server dropped sharply (e.g. midnight Kuwait rolled today→0) AND we
-    //     held a positive offset → trust the server and clear our offset, so
-    //     a stale +1 doesn't survive the daily reset and inflate the new day.
-    // Two-pronged drain:
-    //   1. FIFO match against server movement — if the server's today_count
-    //      moved by Δ in the queue head's direction, pop entries totalling Δ.
-    //      This catches confirmations that the JSONP path missed (network
-    //      drop, callback lost, etc.) before lastSeenData updates and
-    //      double-counts the still-pending entry.
-    //   2. 10s time-out — drop any entry stuck in the queue for too long.
     const now = Date.now();
     Object.keys(pendingDeltas).forEach(k => {
+      const jsonpFresher = (lastJsonpAt[k] || 0) > pullStartedAt;
+      // Time-out stuck queue entries always (independent of freshness check).
+      pendingDeltas[k] = pendingDeltas[k].filter(e => now - e.at < 10000);
+      if (jsonpFresher) return;  // JSONP has newer info for this platform.
+
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
       const prevToday = serverLastSeenToday[k];
       let serverDelta = (prevToday === undefined) ? 0 : (newToday - prevToday);
       const q = pendingDeltas[k];
+      // FIFO drain — pop queue entries the server has caught up to. Catches
+      // confirmations the JSONP path missed (callback lost, network drop).
       while (q.length > 0 && serverDelta !== 0) {
         const head = q[0];
         if (Math.sign(head.delta) !== Math.sign(serverDelta)) break;
@@ -754,16 +774,17 @@ async function pull() {
       }
       pendingDeltas[k] = q.filter(e => now - e.at < 10000);
       serverLastSeenToday[k] = newToday;
+      lastSeenData[k] = parsed.platforms[k] || lastSeenData[k];
     });
-    lastSeenData = parsed.platforms;
     lastSeenMeta = parsed.meta || {};
-    render(parsed);
+    render({ platforms: lastSeenData, meta: lastSeenMeta });
 
     liveText.textContent = 'LIVE';
   } catch (e) {
     liveText.textContent = 'OFFLINE';
   } finally {
     _pullInFlight = false;
+    if (_pullAgain) { _pullAgain = false; pull(); }
   }
 }
 
