@@ -521,17 +521,9 @@ function render(parsed) {
       card.classList.remove('goal-hit');
     }
 
-    // Badge
-    if (p.id === 'youtube_shorts' || p.id === 'youtube_long') {
-      if (status === 'ok')               { badge.className = 'card-badge auto'; badge.textContent = 'AUTO ✓'; }
-      else if (status === 'auth_expired'){ badge.className = 'card-badge warn'; badge.textContent = 'AUTH ⚠'; }
-      else if (status === 'pending')     { badge.className = 'card-badge';      badge.textContent = 'SYNC…'; }
-      else if (status)                   { badge.className = 'card-badge muted'; badge.textContent = 'OFFLINE'; }
-      else                               { badge.className = 'card-badge';      badge.textContent = 'SYNC…'; }
-    } else {
-      badge.className = 'card-badge';
-      badge.textContent = 'SHARED';
-    }
+    // Badge — all platforms are manual now
+    badge.className = 'card-badge';
+    badge.textContent = 'SHARED';
 
     // Animate on increase
     if (lastSeenTotals[p.id] !== undefined && total > lastSeenTotals[p.id]) {
@@ -599,13 +591,7 @@ async function pull() {
     lastSeenMeta = parsed.meta || {};
     render(parsed);
 
-    const ytStatuses = [
-      (parsed.platforms.youtube_shorts || {}).status,
-      (parsed.platforms.youtube_long || {}).status,
-    ];
-    if (ytStatuses.includes('auth_expired')) liveText.textContent = 'YT AUTH ⚠';
-    else if (ytStatuses.includes('ok')) liveText.textContent = 'LIVE';
-    else liveText.textContent = 'SYNCING…';
+    liveText.textContent = 'LIVE';
   } catch (e) {
     liveText.textContent = 'OFFLINE';
   }
