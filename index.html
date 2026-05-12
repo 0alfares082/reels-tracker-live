@@ -747,11 +747,17 @@ async function pull() {
     const text = await r.text();
     const parsed = parseState(text);
     const now = Date.now();
+    // CSV from docs export is eventually-consistent — under rapid writes it
+    // can return a snapshot a few seconds behind. JSONP responses are
+    // authoritative for the click they ack. So if THIS platform had a JSONP
+    // response within the last 5s, treat the CSV as stale and skip overwriting
+    // lastSeenData for it.
+    const PULL_TRUST_JSONP_MS = 5000;
     Object.keys(pendingDeltas).forEach(k => {
-      const jsonpFresher = (lastJsonpAt[k] || 0) > pullStartedAt;
+      const jsonpFresher = (now - (lastJsonpAt[k] || 0)) < PULL_TRUST_JSONP_MS;
       // Time-out stuck queue entries always (independent of freshness check).
       pendingDeltas[k] = pendingDeltas[k].filter(e => now - e.at < 10000);
-      if (jsonpFresher) return;  // JSONP has newer info for this platform.
+      if (jsonpFresher) return;  // JSONP is fresher than this CSV snapshot.
 
       const newToday = (parsed.platforms[k] || {}).today_count || 0;
       const prevToday = serverLastSeenToday[k];
