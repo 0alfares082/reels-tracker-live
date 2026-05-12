@@ -291,30 +291,26 @@ function bumpPlatform(platformId, delta) {
   }
   playChime(delta > 0 ? 'plus' : 'minus');
   showToast(delta > 0 ? '✓ +1 تم' : '✓ −1 تم');
-  // Authoritative webhook call. On success → immediate pull (server is the
-  // source of truth). On failure → roll back the optimistic offset and tell
-  // the user. mode:'no-cors' was hiding silent failures.
+  // Fire-and-forget POST to the webhook. We use no-cors because Apps Script's
+  // 302 redirect to script.googleusercontent.com is finicky with browser CORS
+  // when several writes are in flight at once (Playwright surfaced this:
+  // sequential clicks pass but parallel cross-card bursts hit CORS errors and
+  // rolled back offsets even though the server received the writes).
+  // Trust strategy: schedule a quick pull right after the click — the pull
+  // reads the authoritative sheet state and drains the offset deterministically.
+  // _offsetPendingSince tracks the timestamp of the last bump so pull() can
+  // clear a stuck offset if no server movement is seen within OFFSET_TIMEOUT_MS.
+  _offsetPendingSince[platformId] = Date.now();
   fetch(WEBHOOK_URL, {
-    method: 'POST',
+    method: 'POST', mode: 'no-cors',
     headers: { 'Content-Type': 'text/plain' },
     body: JSON.stringify({ platform: platformId, delta, secret: WEBHOOK_SECRET, source: 'public-dashboard' })
-  })
-  .then(r => r.json())
-  .then(j => {
-    if (!j || !j.ok) throw new Error(j && j.error ? j.error : 'write_failed');
-    schedulePull(150);
-  })
-  .catch(() => {
-    // Roll back the optimistic offset so the display reflects truth.
-    offsets[platformId] = (offsets[platformId] || 0) - delta;
-    render({ platforms: lastSeenData, meta: lastSeenMeta });
-    showToast('✗ ما وصل — حاول مرة ثانية');
-  });
+  }).catch(() => {});
+  schedulePull(1200);
 }
 
-// Single shared scheduler so rapid clicks coalesce to ONE pull. Without this,
-// each click queued its own setTimeout(pull,2500) — N rapid clicks scheduled
-// N pulls that landed out of order and produced visible flicker.
+// Single shared scheduler so rapid clicks coalesce to ONE pull. Each click
+// resets the timer — the actual pull fires `delayMs` after the LAST click.
 let _scheduledPullTimer = null;
 function schedulePull(delayMs) {
   if (_scheduledPullTimer) clearTimeout(_scheduledPullTimer);
@@ -323,6 +319,12 @@ function schedulePull(delayMs) {
     pull();
   }, delayMs);
 }
+
+// Per-platform timestamp of the last bump. Used to time-out stuck offsets
+// (case: webhook silently fails — without this the optimistic offset survives
+// forever and the user sees an inflated local count until refresh).
+const _offsetPendingSince = {};
+const OFFSET_TIMEOUT_MS = 6000;
 
 let lastSeenData = {};
 const POLL_INTERVAL_MS = 20000;  // 20s
@@ -646,6 +648,17 @@ async function pull() {
         } else if (offsets[k] > 0 && serverDelta <= -3) {
           offsets[k] = 0;  // rollover signal — drop optimistic carry
         }
+      }
+      // Stuck-offset safety net: if a bump was issued more than
+      // OFFSET_TIMEOUT_MS ago and the server still hasn't moved, force the
+      // offset to zero so the display reverts to the authoritative count.
+      // This catches the silent-failure case (webhook never landed).
+      if (offsets[k] !== 0 && _offsetPendingSince[k]
+          && (Date.now() - _offsetPendingSince[k]) > OFFSET_TIMEOUT_MS) {
+        offsets[k] = 0;
+        _offsetPendingSince[k] = 0;
+      } else if (offsets[k] === 0) {
+        _offsetPendingSince[k] = 0;
       }
       serverLastSeenToday[k] = newToday;
     });
