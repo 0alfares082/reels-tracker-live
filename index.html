@@ -86,8 +86,13 @@
   @keyframes bump { 0% { transform: scale(1); color: var(--white); } 40% { transform: scale(1.18); color: var(--sky); } 100% { transform: scale(1); color: var(--white); } }
   .card-of { font-family: 'Inter',sans-serif; font-size: 22px; color: var(--muted); font-weight: 500; }
   .card-of b { color: var(--soft-white); font-weight: 700; }
-  .card-remaining { font-size: 14px; color: var(--sky); margin-bottom: 22px; font-weight: 500; }
+  .card-remaining { font-size: 14px; color: var(--sky); margin-bottom: 10px; font-weight: 500; }
   .card-remaining.done { color: var(--orange); text-shadow: 0 0 12px var(--orange-glow); }
+  .card-week-row { display: flex; align-items: center; justify-content: space-between; font-family: 'Inter',sans-serif; font-size: 12px; color: var(--muted); margin-bottom: 14px; letter-spacing: 0.04em; }
+  .card-week-row .card-week-label { font-family: 'Tajawal',sans-serif; font-size: 13px; color: var(--soft-white); font-weight: 500; letter-spacing: 0; }
+  .card-week-row .card-week-num b { color: var(--white); font-weight: 700; font-size: 14px; }
+  .card-week-bar { flex: 1 1 auto; height: 4px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; margin: 0 10px; }
+  .card-week-fill { height: 100%; background: var(--sky); border-radius: 99px; transition: width 0.5s cubic-bezier(0.22,1,0.36,1); }
   .ctrl-row { display: flex; gap: 7px; margin-top: 14px; margin-bottom: 4px; }
   .ctrl-btn { flex: 1; padding: 10px 0; border-radius: 10px; font-family: 'Inter', sans-serif; font-size: 22px; font-weight: 700; cursor: pointer; border: 1.5px solid; background: transparent; transition: background .15s, transform .1s; -webkit-tap-highlight-color: transparent; user-select: none; line-height: 1; }
   .ctrl-btn:active { transform: scale(0.93); }
@@ -380,7 +385,7 @@ function parseState(csvText) {
     if (!r.length || !r[0]) { mode = 'meta'; continue; }
     if (r[0] === 'platform' || r[0] === 'meta') continue;
     if (mode === 'platforms') {
-      const [p, today, total, daily, totalGoal, lastSeen, status] = r;
+      const [p, today, total, daily, totalGoal, lastSeen, status, week, weeklyGoal] = r;
       if (!p) continue;
       platforms[p] = {
         today_count: parseInt(today || 0, 10),
@@ -389,6 +394,8 @@ function parseState(csvText) {
         total_goal: parseInt(totalGoal || 0, 10),
         last_seen_id: lastSeen || '',
         status: status || '',
+        week_count: parseInt(week || 0, 10),
+        weekly_goal: parseInt(weeklyGoal || 0, 10),
       };
     } else {
       meta[r[0]] = r[1];
@@ -414,6 +421,17 @@ function buildCards() {
     ofEl.appendChild(document.createTextNode(' اليوم'));
     const todayRow = el('div', { class: 'card-today-row' }, todayEl, ofEl);
     const remaining = el('div', { class: 'card-remaining', 'data-remaining': '' }, '—');
+    const weekRow = el('div', { class: 'card-week-row' },
+      el('span', { class: 'card-week-label' }, 'هالأسبوع'),
+      el('div', { class: 'card-week-bar' },
+        el('div', { class: 'card-week-fill', 'data-week-fill': '', style: 'width: 0%' })
+      ),
+      el('span', { class: 'card-week-num num' },
+        el('b', { 'data-week': '' }, '0'),
+        el('span', {}, ' / '),
+        el('span', { 'data-week-goal': '' }, '0')
+      )
+    );
     const progLabel = el('div', { class: 'card-progress-label' },
       el('span', {}, '4 شهور'),
       el('span', {},
@@ -430,7 +448,7 @@ function buildCards() {
     btnPlus.addEventListener('click',  () => bumpPlatform(p.id, +1));
     const ctrlRow = el('div', { class: 'ctrl-row' }, btnMinus, btnPlus);
     const card = el('div', { class: 'card', 'data-platform': p.id },
-      head, todayRow, remaining, progLabel, progBar, ctrlRow
+      head, todayRow, remaining, weekRow, progLabel, progBar, ctrlRow
     );
     grid.appendChild(card);
   });
@@ -492,8 +510,10 @@ function render(parsed) {
     const offset = offsets[p.id] || 0;
     const today = (d.today_count || 0) + offset;
     const total = (d.total_count || 0) + offset;
+    const week = (d.week_count || 0) + offset;
     const daily = d.daily_goal || 0;
     const totalGoal = d.total_goal || 0;
+    const weeklyGoal = d.weekly_goal || 0;
     const status = d.status || '';
 
     const todayEl = card.querySelector('[data-today]');
@@ -502,12 +522,18 @@ function render(parsed) {
     const fillEl = card.querySelector('[data-fill]');
     const remainingEl = card.querySelector('[data-remaining]');
     const dailyEl = card.querySelector('[data-daily]');
+    const weekEl = card.querySelector('[data-week]');
+    const weekGoalEl = card.querySelector('[data-week-goal]');
+    const weekFillEl = card.querySelector('[data-week-fill]');
     const badge = card.querySelector('[data-badge]');
 
     todayEl.textContent = today;
     totalEl.textContent = total;
     totalGoalEl.textContent = ' / ' + totalGoal;
     dailyEl.textContent = daily;
+    weekEl.textContent = week;
+    weekGoalEl.textContent = weeklyGoal;
+    weekFillEl.style.width = Math.min(100, weeklyGoal ? (week / weeklyGoal) * 100 : 0) + '%';
     fillEl.style.width = Math.min(100, totalGoal ? (total / totalGoal) * 100 : 0) + '%';
 
     const rem = Math.max(0, daily - today);
